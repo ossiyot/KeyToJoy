@@ -1,117 +1,99 @@
-extern crate winapi;
-
-use std::ffi::OsStr;
-use std::iter::once;
-use std::mem;
-use std::os::windows::ffi::OsStrExt;
-use std::ptr;
-
-use winapi::{
-    shared::minwindef::{HINSTANCE, LPVOID},
-    um::winuser::{GetRawInputData, RegisterRawInputDevices, RAWINPUTHEADER},
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread, time,
 };
 
-use self::winapi::{
-    shared::{
-        hidusage::{HID_USAGE_GENERIC_KEYBOARD, HID_USAGE_PAGE_GENERIC},
-        minwindef::{LPARAM, LRESULT, UINT, WPARAM},
-        windef::HWND,
-    },
-    um::winuser::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
-        TranslateMessage, CS_HREDRAW, CS_OWNDC, CS_VREDRAW, CW_USEDEFAULT, HRAWINPUT, MSG,
-        RAWINPUTDEVICE, RIDEV_INPUTSINK, RID_INPUT, WM_INPUT, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-        WS_VISIBLE, RAWINPUT
-    },
-};
+use multiinput::*;
 
-fn win32_string(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(once(0)).collect()
-}
-
-unsafe extern "system" fn window_proc(
-    hwnd: HWND,
-    msg: UINT,
-    w_param: WPARAM,
-    l_param: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_INPUT => {
-            let mut pcb_size = 0;
-            GetRawInputData(
-                l_param as HRAWINPUT,
-                RID_INPUT,
-                ptr::null_mut(),
-                &mut pcb_size,
-                mem::size_of::<RAWINPUTHEADER>() as UINT,
-            );
-
-            let mut data = vec![0; pcb_size as usize];
-
-            GetRawInputData(
-                l_param as HRAWINPUT,
-                RID_INPUT,
-                data.as_mut_ptr() as LPVOID,
-                &mut pcb_size,
-                mem::size_of::<RAWINPUTHEADER>() as UINT,
-            );
-
-            let ri = ptr::read(data.as_ptr() as *const RAWINPUT);
-            
-            println!("{}", ri.data.keyboard().VKey);
-        }
-        _ => {}
-    }
-
-    DefWindowProcW(hwnd, msg, w_param, l_param)
+#[derive(Default)]
+struct Pressed {
+    throttle: AtomicBool,
+    brake: AtomicBool,
+    left: AtomicBool,
+    right: AtomicBool,
 }
 
 fn main() {
-    let name = win32_string("KeyToJoy");
-    let title = win32_string("KeyToJoy");
-    unsafe {
-        let wnd_class = WNDCLASSW {
-            style: CS_OWNDC | CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(window_proc),
-            hInstance: 0 as HINSTANCE,
-            lpszClassName: name.as_ptr(),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hIcon: ptr::null_mut(),
-            hCursor: ptr::null_mut(),
-            hbrBackground: ptr::null_mut(),
-            lpszMenuName: ptr::null_mut(),
-        };
+    let client: vigem_client::Client = vigem_client::Client::connect().unwrap();
+    let mut target = vigem_client::Xbox360Wired::new(client, vigem_client::TargetId::XBOX360_WIRED);
 
-        RegisterClassW(&wnd_class);
+    target.plugin().unwrap();
 
-        let h_window = CreateWindowExW(
-            0,
-            name.as_ptr(),
-            title.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            0 as HINSTANCE,
-            ptr::null_mut(),
-        );
+    target.wait_ready().unwrap();
 
-        let rid = RAWINPUTDEVICE {
-            usUsagePage: HID_USAGE_PAGE_GENERIC,
-            usUsage: HID_USAGE_GENERIC_KEYBOARD,
-            dwFlags: RIDEV_INPUTSINK,
-            hwndTarget: h_window,
-        };
-        RegisterRawInputDevices([rid].as_ptr(), 1, mem::size_of::<RAWINPUTDEVICE>() as UINT);
+    let mut gamepad = vigem_client::XGamepad {
+        ..Default::default()
+    };
 
-        let mut message: MSG = mem::zeroed();
-        while GetMessageW(&mut message as *mut MSG, h_window, 0, 0) > 0 {
-            TranslateMessage(&message as *const MSG);
-            DispatchMessageW(&message as *const MSG);
+    let pressed = Arc::new(Pressed::default());
+
+    {
+        let pressed = Arc::clone(&pressed);
+
+        thread::spawn(move || {
+            let mut manager = RawInputManager::new().unwrap();
+            manager.register_devices(DeviceType::Keyboards);
+            let tobool = |state| match state {
+                State::Pressed => true,
+                State::Released => false,
+            };
+            loop {
+                if let Some(RawEvent::KeyboardEvent(_, id, state)) = manager.get_event() {
+                    let state = tobool(state);
+                    let input = match id {
+                        KeyId::A => Some(&pressed.left),
+                        KeyId::D => Some(&pressed.right),
+                        KeyId::W => Some(&pressed.throttle),
+                        KeyId::S => Some(&pressed.brake),
+                        _ => None,
+                    };
+                    if let Some(key) = input {
+                        key.store(state, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+    }
+
+    let mut start = time::Instant::now();
+    loop {
+        let elapsed = start.elapsed();
+        start = time::Instant::now();
+
+        if pressed.left.load(Ordering::SeqCst) {
+            let steer = gamepad.thumb_lx as f64 - 100000.0 * elapsed.as_secs_f64();
+            gamepad.thumb_lx = if steer > i16::MIN as f64 {
+                steer as i16
+            } else {
+                i16::MIN
+            }
+        } else if pressed.right.load(Ordering::SeqCst) {
+            let steer = gamepad.thumb_lx as f64 + 100000.0 * elapsed.as_secs_f64();
+            gamepad.thumb_lx = if steer < i16::MAX as f64 {
+                steer as i16
+            } else {
+                i16::MAX
+            }
+        } else {
+            gamepad.thumb_lx = 0;
         }
+
+        gamepad.right_trigger = if pressed.throttle.load(Ordering::SeqCst) {
+            u8::MAX
+        } else {
+            0
+        };
+
+        gamepad.left_trigger = if pressed.brake.load(Ordering::SeqCst) {
+            u8::MAX
+        } else {
+            0
+        };
+
+        let _ = target.update(&gamepad);
+        thread::sleep(time::Duration::from_secs_f64(1.0 / 150.0));
     }
 }
